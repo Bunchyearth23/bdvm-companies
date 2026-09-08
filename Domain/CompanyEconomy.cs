@@ -134,6 +134,15 @@ public sealed class EconomicHistoryRecord
 }
 
 [DataContract]
+public sealed class EconomicGuardrailSettings
+{
+    [DataMember(Name = "enabled", Order = 1)] public bool Enabled { get; set; } = true;
+    [DataMember(Name = "recreationCooldownEvents", Order = 2)] public int RecreationCooldownEvents { get; set; } = 64;
+    [DataMember(Name = "transferCycleWindowEvents", Order = 3)] public int TransferCycleWindowEvents { get; set; } = 32;
+    [DataMember(Name = "maximumTransferCycleDepth", Order = 4)] public int MaximumTransferCycleDepth { get; set; } = 8;
+}
+
+[DataContract]
 public sealed class LicenseEconomicRule
 {
     [DataMember(Name = "stableLicenseId", Order = 1)] public string StableLicenseId { get; set; } = "";
@@ -161,6 +170,7 @@ public sealed class CompanyEconomySnapshot
     [DataMember(Name = "liquidationSales", Order = 11)] public List<LiquidationSaleRecord> LiquidationSales { get; set; } = new List<LiquidationSaleRecord>();
     [DataMember(Name = "licenseRules", Order = 12)] public List<LicenseEconomicRule> LicenseRules { get; set; } = new List<LicenseEconomicRule>();
     [DataMember(Name = "licenseEconomy", Order = 13)] public LicenseEconomyState LicenseEconomy { get; set; } = new LicenseEconomyState();
+    [DataMember(Name = "guardrails", Order = 14)] public EconomicGuardrailSettings Guardrails { get; set; } = new EconomicGuardrailSettings();
 }
 
 public interface IPlayerWalletAdapter
@@ -188,6 +198,7 @@ public sealed class CompanyEconomyEngine
     public CompanyEconomyEngine(CompanyEconomySnapshot state)
     {
         State = state ?? throw new ArgumentNullException(nameof(state));
+        State.Guardrails = State.Guardrails ?? new EconomicGuardrailSettings();
         CompanyEconomyPersistence.Validate(state);
     }
 
@@ -213,7 +224,7 @@ public sealed class CompanyEconomyEngine
             var id = string.IsNullOrWhiteSpace(command.CompanyId) ? Guid.NewGuid().ToString("N") : command.CompanyId!;
             var normalizedName = name.Trim().ToUpperInvariant();
             if (State.Companies.Any(c => c.CompanyId == id) || State.History.Any(h => h.CompanyId == id || (h.Kind == "company-created" && h.Fingerprint == normalizedName))) return "identity-collision";
-            if (State.History.Any(h => h.Kind == "company-dissolved" && h.ActorIds.Contains(player.PlayerId) && h.Fingerprint != "cancelledDebt=0")) return "unresolved-anti-abuse-hold";
+            if (HasRecentUnresolvedDissolution(player.PlayerId)) return "unresolved-anti-abuse-hold";
             var company = new CompanyState { CompanyId = id, Name = name.Trim(), LeaderId = player.PlayerId, Members = new List<string> { player.PlayerId }, Version = 1 };
             State.Companies.Add(company);
             State.Wallets.Add(new Wallet { Account = AccountRef.Company(id), Balance = 0 });
@@ -242,12 +253,11 @@ public sealed class CompanyEconomyEngine
             var from = Wallet(debit); var to = Wallet(credit);
             CheckVersion(command, from.Account.Key, from.Version); CheckVersion(command, to.Account.Key, to.Version);
             var fingerprint = debit.Key + ">" + credit.Key;
-            if ((kind == LedgerEntryKind.Salary || kind == LedgerEntryKind.Reimbursement) &&
-                State.History.Any(h => h.Kind == "account-transfer" && h.Fingerprint == credit.Key + ">" + debit.Key))
+            if ((kind == LedgerEntryKind.Salary || kind == LedgerEntryKind.Reimbursement) && WouldCreateTransferCycle(debit.Key, credit.Key))
                 return "circular-transfer-blocked";
             if (from.Balance < amount) return "insufficient-funds";
             from.Balance -= amount; from.Version++; to.Balance += amount; to.Version++;
-            AddEntry(command, kind, debit, credit, amount, kind.ToString());
+            AddEntry(command, kind, debit, credit, amount, kind + ";source=" + debit.Key + ";destination=" + credit.Key);
             State.History.Add(History("account-transfer", command.CompanyId ?? "", new[] { command.RequesterId }, fingerprint));
             return "transferred";
         });
@@ -569,6 +579,27 @@ public sealed class CompanyEconomyEngine
         State.Commands.Single(c => c.CommandId == command.CommandId).OperationIds.Add(id);
     }
     private static bool AllowedTransferKind(LedgerEntryKind k) => k == LedgerEntryKind.Contribution || k == LedgerEntryKind.Withdrawal || k == LedgerEntryKind.Salary || k == LedgerEntryKind.Reimbursement;
+    private bool HasRecentUnresolvedDissolution(string playerId)
+    {
+        if (!State.Guardrails.Enabled || State.Guardrails.RecreationCooldownEvents == 0) return false;
+        return State.History.AsEnumerable().Reverse().Take(State.Guardrails.RecreationCooldownEvents)
+            .Any(h => h.Kind == "company-dissolved" && h.ActorIds.Contains(playerId) && h.Fingerprint != "cancelledDebt=0");
+    }
+    private bool WouldCreateTransferCycle(string debit, string credit)
+    {
+        if (!State.Guardrails.Enabled || State.Guardrails.TransferCycleWindowEvents == 0) return false;
+        var graph = State.History.AsEnumerable().Reverse().Take(State.Guardrails.TransferCycleWindowEvents)
+            .Where(h => h.Kind == "account-transfer" && h.Fingerprint.Contains(">"))
+            .Select(h => h.Fingerprint.Split(new[] { '>' }, 2)).Where(x => x.Length == 2)
+            .GroupBy(x => x[0], StringComparer.Ordinal).ToDictionary(x => x.Key, x => x.Select(v => v[1]).Distinct(StringComparer.Ordinal).ToArray(), StringComparer.Ordinal);
+        var pending = new Queue<Tuple<string, int>>(); var visited = new HashSet<string>(StringComparer.Ordinal) { credit }; pending.Enqueue(Tuple.Create(credit, 0));
+        while (pending.Count != 0)
+        {
+            var node = pending.Dequeue(); if (node.Item1 == debit) return true; if (node.Item2 >= State.Guardrails.MaximumTransferCycleDepth || !graph.TryGetValue(node.Item1, out var next)) continue;
+            foreach (var target in next) if (visited.Add(target)) pending.Enqueue(Tuple.Create(target, node.Item2 + 1));
+        }
+        return false;
+    }
     private static bool IsSuccessfulResult(string code) => code == "created" || code == "transferred" || code == "revenue-routed" || code == "dissolved" || code == "wallet-synchronized" || code == "wallet-current" || code == "membership-policy-current" || code == "membership-policy-updated" || code == "permission-current" || code == "permission-updated" || code == "company-left" || code == "already-independent" || code == "leadership-current" || code == "leadership-transferred" || code.StartsWith("membership-") || code.StartsWith("invitation-");
     private string DecideRequest(MembershipRequest request, string actorId, CompanyState company, bool accept)
     {
@@ -617,12 +648,15 @@ public static class CompanyEconomyPersistence
         using (var s = new MemoryStream(Encoding.UTF8.GetBytes(json ?? "")))
         {
             var value = Serializer.ReadObject(s) as CompanyEconomySnapshot ?? throw new InvalidDataException("Missing economy snapshot.");
+            value.Guardrails = value.Guardrails ?? new EconomicGuardrailSettings();
             Validate(value); if (value.CheckpointId != expectedCheckpointId) throw new InvalidDataException("Checkpoint mismatch; cross-save state is forbidden."); return value;
         }
     }
     public static void Validate(CompanyEconomySnapshot s)
     {
         if (s == null || s.Schema != CompanyEconomySnapshot.CurrentSchema || s.SchemaVersion != CompanyEconomySnapshot.CurrentVersion || string.IsNullOrWhiteSpace(s.CheckpointId)) throw new InvalidDataException("Unsupported or unscoped company economy snapshot.");
+        s.Guardrails = s.Guardrails ?? new EconomicGuardrailSettings();
+        if (s.Guardrails.RecreationCooldownEvents < 0 || s.Guardrails.RecreationCooldownEvents > 10000 || s.Guardrails.TransferCycleWindowEvents < 0 || s.Guardrails.TransferCycleWindowEvents > 10000 || s.Guardrails.MaximumTransferCycleDepth < 1 || s.Guardrails.MaximumTransferCycleDepth > 64) throw new InvalidDataException("Invalid economic guardrail settings.");
         if (s.Players.GroupBy(p => p.PlayerId).Any(g => g.Count() != 1) || s.Companies.GroupBy(c => c.CompanyId).Any(g => g.Count() != 1) || s.Wallets.GroupBy(w => w.Account.Key).Any(g => g.Count() != 1) || s.Commands.GroupBy(c => c.CommandId).Any(g => g.Count() != 1) || s.Ledger.GroupBy(e => e.EntryId).Any(g => g.Count() != 1)) throw new InvalidDataException("Duplicate durable economy identity.");
         foreach (var p in s.Players) if (p.CompanyId != null && !s.Companies.Any(c => c.CompanyId == p.CompanyId && c.Members.Contains(p.PlayerId))) throw new InvalidDataException("Invalid membership relation.");
         foreach (var company in s.Companies)

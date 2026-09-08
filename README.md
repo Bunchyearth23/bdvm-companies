@@ -31,6 +31,8 @@ The company starts at zero. Members fund and operate it; every player keeps a se
 
 ## Boundaries
 
+Persisted guardrails bound insolvent-dissolution recreation cooldowns and detect multi-hop circular salary or reimbursement transfers inside a configurable recent-history window. Ledger detail retains source and destination account provenance without making company closure impossible forever.
+
 This module does not discover Unity players, directly edit the vanilla wallet, sell world vehicles or cancel another module's contracts itself. Those effects pass through adapters and cancellation ports. It also does not implement dedicated-server transport.
 
 ## Dependencies and composition

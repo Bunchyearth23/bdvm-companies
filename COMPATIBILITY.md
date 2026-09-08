@@ -1,6 +1,6 @@
 # Compatibility matrix
 
-This file is the published compatibility contract for **BDVM.Companies 1.2.0**. It describes the current incremental release; it is not a promise that BDVM is feature-complete.
+This file is the published compatibility contract for **BDVM.Companies 1.3.0**. It describes the current incremental release; it is not a promise that BDVM is feature-complete.
 
 ## Current line
 
