@@ -37,6 +37,8 @@ This module does not discover Unity players, directly edit the vanilla wallet, s
 
 `BDVM.Common` is the only declared project dependency. Fleet, Market and Operations consume Companies, not the reverse. During the migration, `Domain/` remains owned here but is linked into `BDVM.Full`; the small module assembly currently contains the module marker only.
 
+External dependencies: none. Vanilla wallet and Multiplayer behavior enter through Core and runtime adapters rather than direct references from Companies.
+
 ## Build
 
 With sibling repositories under `src/`:
