@@ -59,4 +59,4 @@ All authoritative changes must run on the host. Persistent IDs, command IDs and 
 
 ## License
 
-Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) and the applied copyright [NOTICE](NOTICE).
