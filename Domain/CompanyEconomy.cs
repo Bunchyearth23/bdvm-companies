@@ -88,6 +88,7 @@ public sealed class CommandRecord
     [DataMember(Name = "state", Order = 4)] public CommandState State { get; set; }
     [DataMember(Name = "resultCode", Order = 5)] public string ResultCode { get; set; } = "";
     [DataMember(Name = "operationIds", Order = 6)] public List<string> OperationIds { get; set; } = new List<string>();
+    [DataMember(Name = "fingerprint", Order = 7, EmitDefaultValue = false)] public string Fingerprint { get; set; } = "";
 }
 
 [DataContract]
@@ -219,7 +220,7 @@ public sealed class CompanyEconomyEngine
             player.CompanyId = id; player.Version++;
             State.History.Add(History("company-created", id, new[] { player.PlayerId }, normalizedName));
             return "created";
-        });
+        }, "company-create|" + (name ?? "").Trim().ToUpperInvariant());
     }
 
     public CommandRecord Transfer(EconomyCommand command, AccountRef debit, AccountRef credit, long amount, LedgerEntryKind kind)
@@ -291,10 +292,18 @@ public sealed class CompanyEconomyEngine
     {
         lock (gate)
         {
-            if (State.MembershipRequests.Any(r => r.RequestId == requestId)) return State.MembershipRequests.Single(r => r.RequestId == requestId);
+            var known = State.MembershipRequests.SingleOrDefault(r => r.RequestId == requestId);
+            if (known != null)
+            {
+                if (known.PlayerId != playerId || known.CompanyId != companyId || known.Kind != kind)
+                    throw new InvalidOperationException("Membership request ID is already bound to another request.");
+                return known;
+            }
             var player = Player(playerId); var company = Company(companyId);
             if (player.CompanyId != null || company.Liquidating) throw new InvalidOperationException("Player cannot enter this company.");
             if (kind == MembershipRequestKind.Application && company.MembershipPolicy == MembershipPolicy.InvitationOnly) throw new InvalidOperationException("Applications are disabled.");
+            var pending = State.MembershipRequests.FirstOrDefault(r => r.PlayerId == playerId && r.CompanyId == companyId && r.Kind == kind && r.State == MembershipRequestState.Pending);
+            if (pending != null) return pending;
             var autoAccept = kind == MembershipRequestKind.Application && company.MembershipPolicy == MembershipPolicy.Open;
             var request = new MembershipRequest { RequestId = requestId, PlayerId = playerId, CompanyId = companyId, Kind = kind, State = autoAccept ? MembershipRequestState.Accepted : MembershipRequestState.Pending, Version = 1 };
             State.MembershipRequests.Add(request);
@@ -370,7 +379,7 @@ public sealed class CompanyEconomyEngine
             CheckVersion(command, "company:" + company.CompanyId, company.Version);
             var request = RequestMembership(command.CommandId, command.RequesterId, companyId, MembershipRequestKind.Application);
             return "membership-" + request.State.ToString().ToLowerInvariant();
-        });
+        }, "membership-apply|" + companyId);
     }
 
     public CommandRecord SendInvitation(EconomyCommand command, string targetPlayerId)
@@ -385,7 +394,7 @@ public sealed class CompanyEconomyEngine
             RequirePermission(company, command.RequesterId, CompanyPermission.ManageMembers);
             var request = RequestMembership(command.CommandId, targetPlayerId, companyId, MembershipRequestKind.Invitation);
             return "invitation-" + request.State.ToString().ToLowerInvariant();
-        });
+        }, "membership-invite|" + (command.CompanyId ?? "") + "|" + targetPlayerId);
     }
 
     public CommandRecord DecideApplication(EconomyCommand command, string membershipRequestId, bool accept)
@@ -400,7 +409,7 @@ public sealed class CompanyEconomyEngine
             CheckVersion(command, "membership:" + request.RequestId, request.Version);
             RequirePermission(company, command.RequesterId, CompanyPermission.ManageMembers);
             return DecideRequest(request, command.RequesterId, company, accept);
-        });
+        }, "membership-application-decision|" + membershipRequestId + "|" + accept);
     }
 
     public CommandRecord RespondToInvitation(EconomyCommand command, string membershipRequestId, bool accept)
@@ -415,7 +424,7 @@ public sealed class CompanyEconomyEngine
             CheckVersion(command, "player:" + request.PlayerId, Player(request.PlayerId).Version);
             CheckVersion(command, "membership:" + request.RequestId, request.Version);
             return DecideRequest(request, command.RequesterId, company, accept);
-        });
+        }, "membership-invitation-response|" + membershipRequestId + "|" + accept);
     }
 
     public CommandRecord ChangeMembershipPolicy(EconomyCommand command, MembershipPolicy policy)
@@ -428,7 +437,7 @@ public sealed class CompanyEconomyEngine
             if (company.MembershipPolicy == policy) return "membership-policy-current";
             company.MembershipPolicy = policy; company.Version++;
             return "membership-policy-updated";
-        });
+        }, "membership-policy|" + policy);
     }
 
     public CommandRecord ChangeDelegation(EconomyCommand command, string memberId, CompanyPermission permission, bool enabled)
@@ -437,9 +446,13 @@ public sealed class CompanyEconomyEngine
         {
             var company = Company(command.CompanyId ?? "");
             CheckVersion(command, "company:" + company.CompanyId, company.Version);
+            RequirePermission(company, command.RequesterId, CompanyPermission.ManagePermissions);
+            if (!company.Members.Contains(memberId)) return "delegate-not-member";
+            var current = company.DelegatedPermissions.TryGetValue(memberId, out var rights) && rights.Contains(permission);
+            if (current == enabled) return "permission-current";
             Delegate(command.RequesterId, company.CompanyId, memberId, permission, enabled);
             return "permission-updated";
-        });
+        }, "permission|" + memberId + "|" + permission + "|" + enabled);
     }
 
     public CommandRecord Leave(EconomyCommand command)
@@ -453,7 +466,7 @@ public sealed class CompanyEconomyEngine
             CheckVersion(command, "company:" + company.CompanyId, company.Version);
             LeaveCompany(player.PlayerId);
             return "company-left";
-        });
+        }, "company-leave|" + command.RequesterId + "|" + (command.CompanyId ?? "independent"));
     }
 
     public CommandRecord TransferLeadershipCommand(EconomyCommand command, string newLeaderId)
@@ -463,9 +476,10 @@ public sealed class CompanyEconomyEngine
             var company = Company(command.CompanyId ?? "");
             CheckVersion(command, "company:" + company.CompanyId, company.Version);
             if (company.LeaderId != command.RequesterId) return "leader-required";
+            if (company.LeaderId == newLeaderId) return "leadership-current";
             TransferLeadership(command.RequesterId, company.CompanyId, newLeaderId);
             return "leadership-transferred";
-        });
+        }, "leadership-transfer|" + newLeaderId);
     }
 
     public CommandRecord Dissolve(EconomyCommand command, IReadOnlyList<LiquidationAsset> assets, long debts, long penalties)
@@ -506,27 +520,33 @@ public sealed class CompanyEconomyEngine
                 wallet.Balance = 0; wallet.Version++;
             }
             State.History.Add(History("company-dissolved", company.CompanyId, beneficiaries, "cancelledDebt=" + cancelled));
+            ClosePendingRequestsForCompany(company.CompanyId, command.RequesterId);
             foreach (var member in beneficiaries) { var p = Player(member); p.CompanyId = null; p.Version++; }
             State.Companies.Remove(company); State.Wallets.Remove(wallet);
             return "dissolved";
         });
     }
 
-    private CommandRecord Execute(EconomyCommand command, Func<string> action)
+    private CommandRecord Execute(EconomyCommand command, Func<string> action, string fingerprint = "")
     {
         lock (gate)
         {
             RequireId(command?.CommandId, "commandId"); RequireId(command!.RequesterId, "requesterId");
             var known = State.Commands.FirstOrDefault(c => c.CommandId == command.CommandId);
-            if (known != null) return known;
+            if (known != null)
+            {
+                var sameScope = known.RequesterId == command.RequesterId && known.CompanyId == command.CompanyId;
+                var sameFingerprint = string.IsNullOrEmpty(known.Fingerprint) || string.IsNullOrEmpty(fingerprint) || known.Fingerprint == fingerprint;
+                return sameScope && sameFingerprint ? known : new CommandRecord { CommandId = command.CommandId, RequesterId = command.RequesterId, CompanyId = command.CompanyId, State = CommandState.Rejected, ResultCode = "command-id-reused", Fingerprint = fingerprint };
+            }
             var before = CompanyEconomyPersistence.Serialize(State);
-            var record = new CommandRecord { CommandId = command.CommandId, RequesterId = command.RequesterId, CompanyId = command.CompanyId, State = CommandState.InProgress };
+            var record = new CommandRecord { CommandId = command.CommandId, RequesterId = command.RequesterId, CompanyId = command.CompanyId, State = CommandState.InProgress, Fingerprint = fingerprint };
             State.Commands.Add(record);
             try { record.ResultCode = action(); record.State = IsSuccessfulResult(record.ResultCode) ? CommandState.Succeeded : CommandState.Rejected; }
             catch (Exception ex)
             {
                 Restore(CompanyEconomyPersistence.Deserialize(before, State.CheckpointId));
-                record = new CommandRecord { CommandId = command.CommandId, RequesterId = command.RequesterId, CompanyId = command.CompanyId, State = CommandState.Rejected, ResultCode = ex.GetType().Name + ":" + ex.Message };
+                record = new CommandRecord { CommandId = command.CommandId, RequesterId = command.RequesterId, CompanyId = command.CompanyId, State = CommandState.Rejected, ResultCode = ex.GetType().Name + ":" + ex.Message, Fingerprint = fingerprint };
                 State.Commands.Add(record);
             }
             return record;
@@ -549,7 +569,7 @@ public sealed class CompanyEconomyEngine
         State.Commands.Single(c => c.CommandId == command.CommandId).OperationIds.Add(id);
     }
     private static bool AllowedTransferKind(LedgerEntryKind k) => k == LedgerEntryKind.Contribution || k == LedgerEntryKind.Withdrawal || k == LedgerEntryKind.Salary || k == LedgerEntryKind.Reimbursement;
-    private static bool IsSuccessfulResult(string code) => code == "created" || code == "transferred" || code == "revenue-routed" || code == "dissolved" || code == "wallet-synchronized" || code == "wallet-current" || code == "membership-policy-current" || code == "membership-policy-updated" || code == "permission-updated" || code == "company-left" || code == "already-independent" || code == "leadership-transferred" || code.StartsWith("membership-") || code.StartsWith("invitation-");
+    private static bool IsSuccessfulResult(string code) => code == "created" || code == "transferred" || code == "revenue-routed" || code == "dissolved" || code == "wallet-synchronized" || code == "wallet-current" || code == "membership-policy-current" || code == "membership-policy-updated" || code == "permission-current" || code == "permission-updated" || code == "company-left" || code == "already-independent" || code == "leadership-current" || code == "leadership-transferred" || code.StartsWith("membership-") || code.StartsWith("invitation-");
     private string DecideRequest(MembershipRequest request, string actorId, CompanyState company, bool accept)
     {
         if (request.State != MembershipRequestState.Pending) return "membership-" + request.State.ToString().ToLowerInvariant();
@@ -561,7 +581,26 @@ public sealed class CompanyEconomyEngine
     private void AuthorizeAccount(string actor, AccountRef account) { if (account.Kind == AccountKind.Player && account.OwnerId != actor) throw new InvalidOperationException("Personal account owner required."); if (account.Kind == AccountKind.Company) RequirePermission(Company(account.OwnerId), actor, CompanyPermission.ManageFunds); }
     private static void CheckVersion(EconomyCommand command, string key, long actual) { if (!command.ExpectedVersions.TryGetValue(key, out var expected) || expected != actual) throw new InvalidOperationException("Expected version mismatch: " + key); }
     private static void RequirePermission(CompanyState c, string player, CompanyPermission permission) { if (c.LeaderId == player) return; if (!c.DelegatedPermissions.TryGetValue(player, out var rights) || !rights.Contains(permission)) throw new InvalidOperationException("Permission denied: " + permission); }
-    private void Join(PlayerEconomicState player, CompanyState company) { if (player.ActiveOperation || player.CompanyId != null || company.Liquidating) throw new InvalidOperationException("Membership change is not allowed."); player.CompanyId = company.CompanyId; player.Version++; company.Members.Add(player.PlayerId); company.Version++; }
+    private void Join(PlayerEconomicState player, CompanyState company)
+    {
+        if (player.ActiveOperation || player.CompanyId != null || company.Liquidating) throw new InvalidOperationException("Membership change is not allowed.");
+        player.CompanyId = company.CompanyId; player.Version++; company.Members.Add(player.PlayerId); company.Version++;
+        foreach (var stale in State.MembershipRequests.Where(r => r.PlayerId == player.PlayerId && r.State == MembershipRequestState.Pending).ToArray())
+        {
+            stale.State = MembershipRequestState.Rejected;
+            stale.DecidedBy = "system:joined:" + company.CompanyId;
+            stale.Version++;
+        }
+    }
+    private void ClosePendingRequestsForCompany(string companyId, string actorId)
+    {
+        foreach (var request in State.MembershipRequests.Where(r => r.CompanyId == companyId && r.State == MembershipRequestState.Pending).ToArray())
+        {
+            request.State = MembershipRequestState.Rejected;
+            request.DecidedBy = actorId;
+            request.Version++;
+        }
+    }
     private PlayerEconomicState Player(string id) => State.Players.SingleOrDefault(p => p.PlayerId == id) ?? throw new InvalidOperationException("Unknown player: " + id);
     private CompanyState Company(string id) => State.Companies.SingleOrDefault(c => c.CompanyId == id) ?? throw new InvalidOperationException("Unknown company: " + id);
     private Wallet Wallet(AccountRef account) => State.Wallets.SingleOrDefault(w => w.Account.Key == account.Key) ?? throw new InvalidOperationException("Unknown account: " + account.Key);
@@ -586,6 +625,13 @@ public static class CompanyEconomyPersistence
         if (s == null || s.Schema != CompanyEconomySnapshot.CurrentSchema || s.SchemaVersion != CompanyEconomySnapshot.CurrentVersion || string.IsNullOrWhiteSpace(s.CheckpointId)) throw new InvalidDataException("Unsupported or unscoped company economy snapshot.");
         if (s.Players.GroupBy(p => p.PlayerId).Any(g => g.Count() != 1) || s.Companies.GroupBy(c => c.CompanyId).Any(g => g.Count() != 1) || s.Wallets.GroupBy(w => w.Account.Key).Any(g => g.Count() != 1) || s.Commands.GroupBy(c => c.CommandId).Any(g => g.Count() != 1) || s.Ledger.GroupBy(e => e.EntryId).Any(g => g.Count() != 1)) throw new InvalidDataException("Duplicate durable economy identity.");
         foreach (var p in s.Players) if (p.CompanyId != null && !s.Companies.Any(c => c.CompanyId == p.CompanyId && c.Members.Contains(p.PlayerId))) throw new InvalidDataException("Invalid membership relation.");
+        foreach (var company in s.Companies)
+        {
+            if (!company.Members.Contains(company.LeaderId) || company.Members.Distinct(StringComparer.Ordinal).Count() != company.Members.Count || company.Members.Any(memberId => !s.Players.Any(p => p.PlayerId == memberId && p.CompanyId == company.CompanyId))) throw new InvalidDataException("Invalid company membership invariant.");
+            if (company.DelegatedPermissions.Keys.Any(memberId => !company.Members.Contains(memberId)) || company.DelegatedPermissions.Values.Any(rights => rights.Distinct().Count() != rights.Count)) throw new InvalidDataException("Invalid delegated company permissions.");
+        }
+        foreach (var player in s.Players.Where(p => p.CompanyId != null)) if (s.Companies.Count(c => c.CompanyId == player.CompanyId && c.Members.Contains(player.PlayerId)) != 1) throw new InvalidDataException("Ambiguous company membership relation.");
+        if (s.MembershipRequests.GroupBy(r => r.RequestId).Any(g => g.Count() != 1) || s.MembershipRequests.Any(r => !s.Players.Any(p => p.PlayerId == r.PlayerId))) throw new InvalidDataException("Invalid durable membership request.");
         foreach (var w in s.Wallets) if (w.Balance < 0) throw new InvalidDataException("Negative wallet balance is not permitted.");
         foreach (var rule in s.LicenseRules) if (rule.BlocksGameplayWhenAbsent) throw new InvalidDataException("Licences cannot be the primary gameplay hard gate.");
         LicenseEconomyValidation.ValidateState(s.LicenseEconomy);

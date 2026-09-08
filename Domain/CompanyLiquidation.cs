@@ -110,7 +110,7 @@ public sealed class CompanyLiquidationEngine
             if (company == null) return AddRejected(commandId, fingerprint, requesterId, companyId, debts, penalties, "company-not-found");
             if (!CanDissolve(company, requesterId)) return AddRejected(commandId, fingerprint, requesterId, companyId, debts, penalties, "dissolve-permission-denied");
             var assetIds = state.Ownership.Where(x => x.Owner.Kind == AssetOwnerKind.Company && x.Owner.OwnerId == companyId).Select(x => x.AssetId).OrderBy(x => x, StringComparer.Ordinal).ToList();
-            if (state.OperatingCosts.Any(x => assetIds.Contains(x.AssetId) && (x.State == OperatingCostState.Open || x.ExternalSettlement == ExternalSettlementState.Pending)))
+            if (state.OperatingCosts.Any(x => assetIds.Contains(x.AssetId) && (x.State == OperatingCostState.Open || x.ExternalSettlement == ExternalSettlementState.Pending || x.ExternalSettlement == ExternalSettlementState.Conflict)))
                 return AddRejected(commandId, fingerprint, requesterId, companyId, debts, penalties, "operating-cost-session-active");
             var record = new CompanyLiquidationRecord
             {
