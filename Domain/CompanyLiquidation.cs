@@ -19,6 +19,16 @@ public sealed class NoActiveCompanyContractsPort : ICompanyContractCancellationP
     public WorldOwnershipOutcome Inspect(string companyId) => WorldOwnershipOutcome.Applied;
 }
 
+public interface ICompanyLiquidationCheckpointPort
+{
+    bool TryCheckpoint(CompanyLiquidationRecord record, string phase);
+}
+
+public sealed class NoOpCompanyLiquidationCheckpointPort : ICompanyLiquidationCheckpointPort
+{
+    public bool TryCheckpoint(CompanyLiquidationRecord record, string phase) => true;
+}
+
 public sealed class CompositeCompanyContractCancellationPort : ICompanyContractCancellationPort
 {
     private readonly IReadOnlyList<ICompanyContractCancellationPort> ports;
@@ -68,15 +78,17 @@ public sealed class CompanyLiquidationEngine
     private readonly IAssetReleaseGuard releaseGuard;
     private readonly IExistingVehicleOwnershipAdapter world;
     private readonly ICompanyContractCancellationPort contracts;
+    private readonly ICompanyLiquidationCheckpointPort checkpoint;
 
     public CompanyLiquidationEngine(VehicleAcquisitionSnapshot state, INetworkRoleDetector authority, IAssetReleaseGuard releaseGuard,
-        IExistingVehicleOwnershipAdapter world, ICompanyContractCancellationPort contracts)
+        IExistingVehicleOwnershipAdapter world, ICompanyContractCancellationPort contracts, ICompanyLiquidationCheckpointPort? checkpoint = null)
     {
         this.state = state ?? throw new ArgumentNullException(nameof(state));
         this.authority = authority ?? throw new ArgumentNullException(nameof(authority));
         this.releaseGuard = releaseGuard ?? throw new ArgumentNullException(nameof(releaseGuard));
         this.world = world ?? throw new ArgumentNullException(nameof(world));
         this.contracts = contracts ?? throw new ArgumentNullException(nameof(contracts));
+        this.checkpoint = checkpoint ?? new NoOpCompanyLiquidationCheckpointPort();
         VehicleAcquisitionPersistence.Validate(state);
     }
 
@@ -107,6 +119,7 @@ public sealed class CompanyLiquidationEngine
                 Debts = debts, Penalties = penalties, State = CompanyLiquidationState.ReconcileRequired, ResultCode = "prepared"
             };
             state.CompanyLiquidations.Add(record);
+            if (!TryCheckpoint(record, "prepared")) return Pending(record, "checkpoint-prepared-failed");
             var inspections = InspectAll(assetIds);
             record.Detail = string.Join("|", inspections.Select(x => x.Key + ":" + x.Value.Detail));
             if (inspections.Values.Any(x => x.Status == AssetReleaseStatus.Blocked)) return Reject(record, "asset-not-releasable");
@@ -116,11 +129,13 @@ public sealed class CompanyLiquidationEngine
             if (contractOutcome == WorldOwnershipOutcome.NotApplied) return Reject(record, "contract-cancellation-refused");
             if (contractOutcome == WorldOwnershipOutcome.Unknown) return Pending(record, "contract-cancellation-unknown");
             record.ContractsCancelled = true;
+            if (!TryCheckpoint(record, "contracts-cancelled")) return Pending(record, "checkpoint-contracts-failed");
             foreach (var assetId in assetIds)
             {
                 var asset = state.Assets.Assets.Single(x => x.AssetId == assetId);
                 var outcome = world.ApplyOwner(commandId + ":merchant:" + assetId, asset.GameLink.Value!, AssetOwnerRef.Merchant("runtime-market"));
                 if (outcome != WorldOwnershipOutcome.Applied) return Pending(record, outcome == WorldOwnershipOutcome.Unknown ? "world-owner-unknown" : "world-partial-transfer");
+                if (!TryCheckpoint(record, "world-owner:" + assetId)) return Pending(record, "checkpoint-world-owner-failed");
             }
             return Commit(record);
         }
@@ -142,6 +157,7 @@ public sealed class CompanyLiquidationEngine
                     if (contractState != WorldOwnershipOutcome.Applied) return Pending(record, "contract-cancellation-pending");
                 }
                 record.ContractsCancelled = true;
+                if (!TryCheckpoint(record, "contracts-reconciled")) return Pending(record, "checkpoint-contracts-failed");
             }
             if (!record.OwnershipCommitted)
             {
@@ -151,6 +167,7 @@ public sealed class CompanyLiquidationEngine
                     var outcome = world.InspectOwner(link, AssetOwnerRef.Merchant("runtime-market"));
                     if (outcome == WorldOwnershipOutcome.NotApplied) outcome = world.ApplyOwner(record.CommandId + ":merchant:" + id, link, AssetOwnerRef.Merchant("runtime-market"));
                     if (outcome != WorldOwnershipOutcome.Applied) return Pending(record, "world-partial-or-unknown");
+                    if (!TryCheckpoint(record, "world-owner-reconciled:" + id)) return Pending(record, "checkpoint-world-owner-failed");
                 }
             }
             return Commit(record);
@@ -167,6 +184,7 @@ public sealed class CompanyLiquidationEngine
                 var fleet = state.Fleet.SingleOrDefault(x => x.AssetId == id); if (fleet != null) { fleet.Operator = null; fleet.OperationalState = FleetOperationalState.Stored; fleet.Version++; }
             }
             record.OwnershipCommitted = true;
+            if (!TryCheckpoint(record, "ownership-committed")) return Pending(record, "checkpoint-ownership-failed");
         }
         if (!record.EconomyCommitted)
         {
@@ -181,8 +199,11 @@ public sealed class CompanyLiquidationEngine
                 if (result.State != CommandState.Succeeded) return Pending(record, "economy-commit-refused:" + result.ResultCode);
             }
             record.EconomyCommitted = true;
+            if (!TryCheckpoint(record, "economy-committed")) return Pending(record, "checkpoint-economy-failed");
         }
-        record.State = CompanyLiquidationState.Succeeded; record.ResultCode = "dissolved"; return record;
+        record.State = CompanyLiquidationState.Succeeded; record.ResultCode = "dissolved";
+        if (!TryCheckpoint(record, "completed")) return Pending(record, "checkpoint-completion-failed");
+        return record;
     }
 
     private bool PreviewEconomy(CompanyLiquidationRecord record)
@@ -212,6 +233,11 @@ public sealed class CompanyLiquidationEngine
     }
 
     private static bool CanDissolve(CompanyState company, string playerId) => company.LeaderId == playerId || (company.DelegatedPermissions.TryGetValue(playerId, out var rights) && rights.Contains(CompanyPermission.Dissolve));
+    private bool TryCheckpoint(CompanyLiquidationRecord record, string phase)
+    {
+        try { return checkpoint.TryCheckpoint(record, phase); }
+        catch (Exception exception) { record.Detail = string.IsNullOrWhiteSpace(record.Detail) ? "checkpoint:" + phase + ":" + exception.GetType().Name : record.Detail + "|checkpoint:" + phase + ":" + exception.GetType().Name; return false; }
+    }
     private CompanyLiquidationRecord AddRejected(string command, string fingerprint, string requester, string company, long debts, long penalties, string code)
     {
         var record = new CompanyLiquidationRecord { CommandId = command, Fingerprint = fingerprint, RequesterId = requester, CompanyId = company, Debts = debts, Penalties = penalties };
