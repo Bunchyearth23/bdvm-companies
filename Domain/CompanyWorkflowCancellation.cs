@@ -67,10 +67,22 @@ public sealed class CompanyWorkflowCancellationPort : ICompanyContractCancellati
 
     private void CancelIndustrial(string companyId)
     {
-        foreach (var contract in state.IndustrialContracts.Where(x => x.Beneficiary.Kind == AccountKind.Company && x.Beneficiary.OwnerId == companyId && x.State != IndustrialContractState.Completed && x.State != IndustrialContractState.Cancelled))
+        foreach (var contract in state.IndustrialContracts.Where(x => x.Beneficiary.Kind == AccountKind.Company && x.Beneficiary.OwnerId == companyId && x.State != IndustrialContractState.Completed && x.State != IndustrialContractState.Cancelled && x.State != IndustrialContractState.Expired))
         {
-            var remaining = contract.Quantity - contract.DeliveredQuantity;
-            if (contract.State != IndustrialContractState.Offered) { var source = state.IndustrialStocks.Single(x => x.FacilityId == contract.OriginFacilityId && x.CargoId == contract.CargoId); var destination = state.IndustrialStocks.Single(x => x.FacilityId == contract.DestinationFacilityId && x.CargoId == contract.CargoId); source.ReservedOutbound -= remaining; source.Version++; destination.ReservedInbound -= remaining; destination.Version++; }
+            if (contract.State != IndustrialContractState.Offered && !contract.ReservationsReleased)
+            {
+                var loaded = (contract.Manifests == null ? Enumerable.Empty<CargoManifest>() : contract.Manifests).Sum(x => x.LoadedQuantity);
+                var source = state.IndustrialStocks.Single(x => x.FacilityId == contract.OriginFacilityId && x.CargoId == contract.CargoId);
+                var destination = state.IndustrialStocks.Single(x => x.FacilityId == contract.DestinationFacilityId && x.CargoId == contract.CargoId);
+                source.ReservedOutbound -= Math.Min(source.ReservedOutbound, Math.Max(0m, contract.Quantity - loaded)); source.Version++;
+                destination.ReservedInbound -= Math.Min(destination.ReservedInbound, Math.Max(0m, contract.Quantity - contract.DeliveredQuantity)); destination.Version++;
+                contract.ReservationsReleased = true;
+            }
+            foreach (var wagon in contract.AssignedWagons == null ? Enumerable.Empty<ContractWagonAssignment>() : contract.AssignedWagons)
+            {
+                var fleet = state.Fleet.SingleOrDefault(x => x.AssetId == wagon.AssetId);
+                if (fleet != null && (fleet.OperationalState == FleetOperationalState.Reserved || fleet.OperationalState == FleetOperationalState.InService)) { fleet.OperationalState = FleetOperationalState.Available; fleet.Version++; }
+            }
             contract.State = IndustrialContractState.Cancelled; contract.Version++;
         }
     }
@@ -96,7 +108,7 @@ public sealed class CompanyWorkflowCancellationPort : ICompanyContractCancellati
         state.Leases.Any(x => x.Lessee != null && IsCompany(x.Lessee, companyId) && x.State != LeaseState.Returned && x.State != LeaseState.Purchased && x.State != LeaseState.Cancelled) ||
         state.Assignments.Any(x => IsCompany(x.Operator, companyId) && x.State != MissionAssignmentState.Completed && x.State != MissionAssignmentState.Cancelled) ||
         state.PassengerContracts.Any(x => IsCompany(x.Operator, companyId) && x.State != PassengerContractState.Completed && x.State != PassengerContractState.Cancelled) ||
-        state.IndustrialContracts.Any(x => x.Beneficiary.Kind == AccountKind.Company && x.Beneficiary.OwnerId == companyId && x.State != IndustrialContractState.Completed && x.State != IndustrialContractState.Cancelled) ||
+        state.IndustrialContracts.Any(x => x.Beneficiary.Kind == AccountKind.Company && x.Beneficiary.OwnerId == companyId && x.State != IndustrialContractState.Completed && x.State != IndustrialContractState.Cancelled && x.State != IndustrialContractState.Expired) ||
         state.TriageAssistance.Plans.Any(x => x.State != TriagePlanState.Completed && x.State != TriagePlanState.Cancelled && x.State != TriagePlanState.Rejected && state.Assignments.Any(a => a.AssignmentId == x.AssignmentId && IsCompany(a.Operator, companyId)));
 
     private void AddLedger(string id, LedgerEntryKind kind, AccountRef? debit, AccountRef? credit, long amount, string detail) { if (amount <= 0 || state.Economy.Ledger.Any(x => x.EntryId == id)) return; state.Economy.Ledger.Add(new LedgerEntry { EntryId = id, CommandId = id, Kind = kind, Debit = debit, Credit = credit, Amount = amount, Detail = detail }); }
