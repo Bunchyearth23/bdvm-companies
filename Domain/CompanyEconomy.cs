@@ -156,7 +156,7 @@ public sealed class LicenseEconomicRule
 public sealed class CompanyEconomySnapshot
 {
     public const string CurrentSchema = "bdvm.company-economy";
-    public const int CurrentVersion = 2;
+    public const int CurrentVersion = 3;
     [DataMember(Name = "schema", Order = 1)] public string Schema { get; set; } = CurrentSchema;
     [DataMember(Name = "schemaVersion", Order = 2)] public int SchemaVersion { get; set; } = CurrentVersion;
     [DataMember(Name = "checkpointId", Order = 3)] public string CheckpointId { get; set; } = "";
@@ -171,6 +171,7 @@ public sealed class CompanyEconomySnapshot
     [DataMember(Name = "licenseRules", Order = 12)] public List<LicenseEconomicRule> LicenseRules { get; set; } = new List<LicenseEconomicRule>();
     [DataMember(Name = "licenseEconomy", Order = 13)] public LicenseEconomyState LicenseEconomy { get; set; } = new LicenseEconomyState();
     [DataMember(Name = "guardrails", Order = 14)] public EconomicGuardrailSettings Guardrails { get; set; } = new EconomicGuardrailSettings();
+    [DataMember(Name = "externalWalletMirrors", Order = 15)] public List<ExternalWalletMirrorRecord> ExternalWalletMirrors { get; set; } = new List<ExternalWalletMirrorRecord>();
 }
 
 public interface IPlayerWalletAdapter
@@ -648,7 +649,7 @@ public static class CompanyEconomyPersistence
         using (var s = new MemoryStream(Encoding.UTF8.GetBytes(json ?? "")))
         {
             var value = Serializer.ReadObject(s) as CompanyEconomySnapshot ?? throw new InvalidDataException("Missing economy snapshot.");
-            value.Guardrails = value.Guardrails ?? new EconomicGuardrailSettings();
+            Migrate(value);
             Validate(value); if (value.CheckpointId != expectedCheckpointId) throw new InvalidDataException("Checkpoint mismatch; cross-save state is forbidden."); return value;
         }
     }
@@ -656,6 +657,7 @@ public static class CompanyEconomyPersistence
     {
         if (s == null || s.Schema != CompanyEconomySnapshot.CurrentSchema || s.SchemaVersion != CompanyEconomySnapshot.CurrentVersion || string.IsNullOrWhiteSpace(s.CheckpointId)) throw new InvalidDataException("Unsupported or unscoped company economy snapshot.");
         s.Guardrails = s.Guardrails ?? new EconomicGuardrailSettings();
+        s.ExternalWalletMirrors = s.ExternalWalletMirrors ?? new List<ExternalWalletMirrorRecord>();
         if (s.Guardrails.RecreationCooldownEvents < 0 || s.Guardrails.RecreationCooldownEvents > 10000 || s.Guardrails.TransferCycleWindowEvents < 0 || s.Guardrails.TransferCycleWindowEvents > 10000 || s.Guardrails.MaximumTransferCycleDepth < 1 || s.Guardrails.MaximumTransferCycleDepth > 64) throw new InvalidDataException("Invalid economic guardrail settings.");
         if (s.Players.GroupBy(p => p.PlayerId).Any(g => g.Count() != 1) || s.Companies.GroupBy(c => c.CompanyId).Any(g => g.Count() != 1) || s.Wallets.GroupBy(w => w.Account.Key).Any(g => g.Count() != 1) || s.Commands.GroupBy(c => c.CommandId).Any(g => g.Count() != 1) || s.Ledger.GroupBy(e => e.EntryId).Any(g => g.Count() != 1)) throw new InvalidDataException("Duplicate durable economy identity.");
         foreach (var p in s.Players) if (p.CompanyId != null && !s.Companies.Any(c => c.CompanyId == p.CompanyId && c.Members.Contains(p.PlayerId))) throw new InvalidDataException("Invalid membership relation.");
@@ -669,5 +671,17 @@ public static class CompanyEconomyPersistence
         foreach (var w in s.Wallets) if (w.Balance < 0) throw new InvalidDataException("Negative wallet balance is not permitted.");
         foreach (var rule in s.LicenseRules) if (rule.BlocksGameplayWhenAbsent) throw new InvalidDataException("Licences cannot be the primary gameplay hard gate.");
         LicenseEconomyValidation.ValidateState(s.LicenseEconomy);
+        ExternalWalletMirrorEngine.Validate(s);
+    }
+
+    public static void Migrate(CompanyEconomySnapshot value)
+    {
+        if (value == null) throw new InvalidDataException("Missing economy snapshot.");
+        if (value.Schema == CompanyEconomySnapshot.CurrentSchema && value.SchemaVersion >= 1 && value.SchemaVersion < CompanyEconomySnapshot.CurrentVersion)
+        {
+            value.Guardrails = value.Guardrails ?? new EconomicGuardrailSettings();
+            value.ExternalWalletMirrors = value.ExternalWalletMirrors ?? new List<ExternalWalletMirrorRecord>();
+            value.SchemaVersion = CompanyEconomySnapshot.CurrentVersion;
+        }
     }
 }

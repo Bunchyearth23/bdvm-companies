@@ -57,7 +57,7 @@ Domain validation covers membership permissions, wallet isolation, idempotency, 
 
 ## Compatibility
 
-All authoritative changes must run on the host. Persistent IDs, command IDs and ledger references are stable data; changing their meaning requires an explicit migration. Legacy `DVCompany` state is not imported.
+All authoritative changes must run on the host. Persistent IDs, command IDs and ledger references are stable data; changing their meaning requires an explicit migration. Unsupported legacy checkpoint formats are refused without mutation.
 
 ## License
 
